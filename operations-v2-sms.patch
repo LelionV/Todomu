@@ -1,0 +1,1471 @@
+diff --git a/SMS_SETUP.md b/SMS_SETUP.md
+new file mode 100644
+index 0000000..64671a8
+--- /dev/null
++++ b/SMS_SETUP.md
+@@ -0,0 +1,55 @@
++# Visitor SMS (Talksasa) — setup and change notes
++
++## What changed
++
++1. **Auto-selected department.** When a visit is booked (web form or mobile API) without a
++   host staff member *or* a department, the department of the person booking is used.
++   If that person has no department, the form asks them to choose one.
++2. **SMS to the host only.** Visitor notifications are sent only by SMS (Talksasa BulkSMS)
++   and only to the host. Email, in-app and WhatsApp messages for visitor events were removed.
++   The host is:
++   - the selected host staff member, otherwise
++   - the HOD of the selected (or auto-selected) department, otherwise
++   - the person who booked the visit.
++
++   SMS are sent when a visit is booked, when the visitor is checked in at the gate,
++   when a visit is cancelled (unless the host cancelled it), and to the new host if
++   the host is changed while the visit is still scheduled.
++3. **Host mobile number, saved until changed.** The booking form shows who will get the SMS
++   and pre-fills their saved mobile number. If none is saved, the number is required. Whatever
++   is entered is saved to the host's user profile and reused on later bookings until someone
++   changes it. Every user can also save their own number on the Visitor Dashboard.
++   Numbers are stored as +2547XXXXXXXX / +2541XXXXXXXX.
++4. **System → SMS Settings** (administrators): enable/disable, API endpoint, API token,
++   sender ID, and a "Send test SMS" button. The WhatsApp Config menu item was removed.
++5. Each SMS result (sent / failed and why) is written to the appointment's Activity Log and
++   shown on screen.
++
++No database migration is needed and no new Python package is required
++(the Talksasa client uses only the standard library).
++
++## Setup
++
++1. Deploy the files and restart the application.
++2. Sign in as an administrator → **System → SMS Settings** (`/Operations/system/sms/`).
++3. Paste the Talksasa **API token**, enter your approved **Sender ID**, keep the endpoint
++   `https://bulksms.talksasa.com/api/v3/`, set **Enable SMS Notifications** to Enabled, save.
++4. Use **Send Test SMS** with your own number.
++
++Alternatively set `TALKSASA_API_TOKEN`, `TALKSASA_SENDER_ID` and `TALKSASA_API_URL` in `.env`;
++values saved on the SMS Settings page take priority.
++
++## Talksasa request used
++
++    POST https://bulksms.talksasa.com/api/v3/sms/send
++    Authorization: Bearer <API token>
++    Content-Type: application/json
++    {"recipient": "254712345678", "sender_id": "<sender id>", "type": "plain", "message": "..."}
++
++## Files
++
++New:      apps/visitors/sms.py, templates/settings_manager/sms.html, SMS_SETUP.md
++Changed:  apps/visitors/{models,forms,views,notifications,urls}.py, apps/visitors/api/views.py,
++          apps/settings_manager/{models,views,urls}.py, templates/base.html,
++          templates/visitors/{form,detail,dashboard}.html
++Unused (kept, not linked): apps/visitors/whatsapp.py and the WhatsApp config page/model.
+diff --git a/apps/settings_manager/models.py b/apps/settings_manager/models.py
+index 312df9c..d5c7335 100644
+--- a/apps/settings_manager/models.py
++++ b/apps/settings_manager/models.py
+@@ -38,3 +38,19 @@ class SystemSetting(models.Model):
+             'DEFAULT_FROM_EMAIL':  cls.get('email_from', 'noreply@po-system.com'),
+             'EMAIL_ENABLED':       cls.get('email_enabled', 'false').lower() == 'true',
+         }
++
++    @classmethod
++    def get_sms_config(cls):
++        """
++        Talksasa BulkSMS settings. Values saved in System → SMS Settings win;
++        TALKSASA_* environment variables (.env) are used as fall-backs.
++        """
++        import os
++        env_token = os.environ.get('TALKSASA_API_TOKEN', '')
++        return {
++            'enabled':   cls.get('sms_enabled', 'true' if env_token else 'false').lower() == 'true',
++            'endpoint':  cls.get('sms_api_url', '') or os.environ.get(
++                             'TALKSASA_API_URL', 'https://bulksms.talksasa.com/api/v3/'),
++            'token':     cls.get('sms_api_token', '') or env_token,
++            'sender_id': cls.get('sms_sender_id', '') or os.environ.get('TALKSASA_SENDER_ID', ''),
++        }
+diff --git a/apps/settings_manager/urls.py b/apps/settings_manager/urls.py
+index 8e234f5..0fc1af8 100644
+--- a/apps/settings_manager/urls.py
++++ b/apps/settings_manager/urls.py
+@@ -6,4 +6,6 @@ app_name = 'settings_manager'
+ urlpatterns = [
+     path('email/',      views.EmailSettingsView.as_view(), name='email'),
+     path('test-email/', views.test_email,                  name='test_email'),
++    path('sms/',        views.SMSSettingsView.as_view(),   name='sms'),
++    path('test-sms/',   views.test_sms,                    name='test_sms'),
+ ]
+diff --git a/apps/settings_manager/views.py b/apps/settings_manager/views.py
+index 5cce283..56ad048 100644
+--- a/apps/settings_manager/views.py
++++ b/apps/settings_manager/views.py
+@@ -140,3 +140,99 @@ def test_email(request):
+         except Exception as e:
+             messages.error(request, f'Failed to send test email: {e}')
+     return redirect(reverse_lazy('settings_manager:email'))
++
++
++# ── SMS (Talksasa BulkSMS) ────────────────────────────────────────────────────
++
++SMS_FIELDS = [
++    {'key': 'sms_enabled',   'label': 'Enable SMS Notifications',
++     'description': 'Turn on/off visitor SMS notifications to hosts.',
++     'is_password': False},
++    {'key': 'sms_api_url',   'label': 'Talksasa API Endpoint',
++     'description': 'Talksasa OAuth 2.0 API endpoint (v3).',
++     'is_password': False},
++    {'key': 'sms_api_token', 'label': 'Talksasa API Token',
++     'description': 'Bearer token from your Talksasa account (Developers → API token).',
++     'is_password': True},
++    {'key': 'sms_sender_id', 'label': 'Sender ID',
++     'description': 'Your approved sender ID (max 11 characters).',
++     'is_password': False},
++]
++
++
++def _seed_sms_settings():
++    import os
++    defaults = {
++        'sms_enabled':   'false',
++        'sms_api_url':   os.environ.get('TALKSASA_API_URL', 'https://bulksms.talksasa.com/api/v3/'),
++        'sms_api_token': '',
++        'sms_sender_id': os.environ.get('TALKSASA_SENDER_ID', ''),
++    }
++    for field in SMS_FIELDS:
++        SystemSetting.objects.get_or_create(
++            key=field['key'],
++            defaults={
++                'label':       field['label'],
++                'description': field['description'],
++                'is_password': field['is_password'],
++                'value':       defaults.get(field['key'], ''),
++            }
++        )
++
++
++class SMSSettingsView(StaffRequiredMixin, TemplateView):
++    template_name = 'settings_manager/sms.html'
++
++    def get(self, request, *args, **kwargs):
++        _seed_sms_settings()
++        return super().get(request, *args, **kwargs)
++
++    def get_context_data(self, **kwargs):
++        import os
++        ctx = super().get_context_data(**kwargs)
++        settings_qs = SystemSetting.objects.filter(key__startswith='sms_')
++        ctx['field_map'] = {s.key: s for s in settings_qs}
++        token = ctx['field_map'].get('sms_api_token')
++        ctx['token_saved'] = bool(token and token.value)
++        ctx['token_from_env'] = not ctx['token_saved'] and bool(os.environ.get('TALKSASA_API_TOKEN'))
++        ctx['token_hint'] = (token.value.split('|')[0] + '|••••••') if ctx['token_saved'] and '|' in token.value \
++            else ('••••••' if ctx['token_saved'] else '')
++        ctx['sms_config'] = SystemSetting.get_sms_config()
++        return ctx
++
++    def post(self, request, *args, **kwargs):
++        _seed_sms_settings()
++        for field in SMS_FIELDS:
++            key = field['key']
++            val = request.POST.get(key, '').strip()
++            setting = SystemSetting.objects.get(key=key)
++            if field['is_password']:
++                if request.POST.get('sms_api_token_clear'):
++                    val = ''
++                elif not val:
++                    continue  # keep the existing token
++            if key == 'sms_sender_id':
++                val = val[:11]
++            setting.value = val
++            setting.label = field['label']
++            setting.description = field['description']
++            setting.is_password = field['is_password']
++            setting.save()
++        messages.success(request, 'SMS settings saved.')
++        return redirect(reverse_lazy('settings_manager:sms'))
++
++
++@login_required
++def test_sms(request):
++    if not request.user.is_staff:
++        messages.error(request, 'Staff only.')
++        return redirect('/')
++    if request.method == 'POST':
++        from apps.visitors.sms import send_sms
++        to = request.POST.get('test_sms_to', '').strip()
++        if not to:
++            messages.error(request, 'Enter a mobile number.')
++        else:
++            ok, detail = send_sms(to, 'Test SMS from Operations Suite. Your Talksasa settings are working.')
++            (messages.success if ok else messages.error)(request, detail)
++    return redirect(reverse_lazy('settings_manager:sms'))
+diff --git a/apps/visitors/api/views.py b/apps/visitors/api/views.py
+index d270779..f0366fc 100644
+--- a/apps/visitors/api/views.py
++++ b/apps/visitors/api/views.py
+@@ -10,7 +10,8 @@ Endpoints:
+   POST /visitors/api/appointments/<ref>/arrive/  — check in visitor
+   POST /visitors/api/appointments/<ref>/status/  — update status
+   GET  /visitors/api/today/                 — today's appointments
+-  POST /visitors/api/whatsapp/test/         — test WhatsApp send (staff)
++
++Notifications: the host is the only person notified, by SMS (Talksasa).
+ """
+ import json
+ from django.http import JsonResponse
+@@ -139,14 +140,21 @@ def appointment_list_create(request):
+         if not data.get(f):
+             return JsonResponse({'error': f'{f} is required.'}, status=400)
+ 
+-    if not data.get('host_user') and not data.get('host_department'):
+-        return JsonResponse({'error': 'Provide host_user (id) or host_department (id).'}, status=400)
+-
+     from ..models import VisitorAppointment
++    from ..sms import normalize_phone, display_phone
+     from apps.accounts.models import User
+ 
+     from apps.departments.models import Department
+ 
++    # No host and no department → use the caller's own department
++    auto_department = False
++    if not data.get('host_user') and not data.get('host_department'):
++        if not request.api_user.department_id:
++            return JsonResponse({'error': 'You are not assigned to a department; '
++                                          'provide host_user (id) or host_department (id).'}, status=400)
++        data['host_department'] = request.api_user.department_id
++        auto_department = True
++
+     appt = VisitorAppointment()
+     appt.visitor_name      = data['visitor_name']
+     appt.visitor_email     = data.get('visitor_email','')
+@@ -174,14 +182,36 @@ def appointment_list_create(request):
+         except Department.DoesNotExist:
+             return JsonResponse({'error': 'host_department not found.'}, status=404)
+ 
++    # Host mobile number: sent value wins (and is saved), otherwise the saved one
++    host = appt.resolve_host()
++    typed = str(data.get('host_phone') or '').strip()
++    if typed and not normalize_phone(typed):
++        return JsonResponse({'error': 'host_phone is not a valid Kenyan mobile number.'}, status=400)
++    if not typed and not normalize_phone(getattr(host, 'phone', '')):
++        return JsonResponse({'error': f'host_phone is required: {host.get_full_name()} '
++                                      f'has no mobile number saved.'}, status=400)
++
+     appt.save()
++    phone_saved = False
++    if typed and normalize_phone(host.phone) != normalize_phone(typed):
++        host.phone = display_phone(typed)
++        host.save(update_fields=['phone'])
++        phone_saved = True
++
++    from ..notifications import notify_appointment_booked
++    ok, detail = notify_appointment_booked(appt)
++    notes = ['Created via API.']
++    if auto_department:
++        notes.append(f'Department auto-selected: {appt.host_department.name}.')
++    if phone_saved:
++        notes.append('Host mobile number saved to profile.')
++    notes.append(detail)
+     from ..models import VisitorLog
+     VisitorLog.objects.create(appointment=appt, actor=request.api_user,
+-        from_status='', to_status='SCHEDULED', notes='Created via API.')
+-    from ..notifications import notify_appointment_booked
+-    notify_appointment_booked(appt)
++        from_status='', to_status='SCHEDULED', notes=' '.join(notes))
+ 
+-    return JsonResponse({'appointment': _appt_to_dict(appt)}, status=201)
++    return JsonResponse({'appointment': _appt_to_dict(appt),
++                         'sms': {'sent': ok, 'detail': detail}}, status=201)
+ 
+ 
+ @csrf_exempt
+@@ -224,12 +254,14 @@ def appointment_arrive(request, ref):
+     appt.arrived_at   = timezone.now()
+     appt.badge_number = data.get('badge_number','')
+     appt.save(update_fields=['status','arrived_at','badge_number'])
+-    VisitorLog.objects.create(appointment=appt, actor=user,
+-        from_status=prev, to_status='ARRIVED', notes=data.get('notes','API check-in.'))
+     from ..notifications import notify_host_on_arrival
+-    notify_host_on_arrival(appt)
++    ok, detail = notify_host_on_arrival(appt)
++    VisitorLog.objects.create(appointment=appt, actor=user,
++        from_status=prev, to_status='ARRIVED',
++        notes=f"{data.get('notes') or 'API check-in.'} {detail}")
+ 
+-    return JsonResponse({'appointment': _appt_to_dict(appt), 'message': 'Visitor checked in.'})
++    return JsonResponse({'appointment': _appt_to_dict(appt), 'message': 'Visitor checked in.',
++                         'sms': {'sent': ok, 'detail': detail}})
+ 
+ 
+ @csrf_exempt
+@@ -262,14 +294,20 @@ def appointment_status(request, ref):
+     if new_s in ('COMPLETED','NO_SHOW'):
+         appt.checked_out_at = timezone.now()
+     appt.save()
+-    VisitorLog.objects.create(appointment=appt, actor=user,
+-        from_status=prev, to_status=new_s, notes=data.get('notes',''))
+-
+-    if new_s == 'CANCELLED':
++    notes = data.get('notes', '')
++    sms = None
++    if new_s == 'CANCELLED' and prev != 'CANCELLED':
+         from ..notifications import notify_appointment_cancelled
+-        notify_appointment_cancelled(appt)
++        ok, detail = notify_appointment_cancelled(appt, actor=user)
++        sms = {'sent': ok, 'detail': detail}
++        notes = (notes + ' ' if notes else '') + detail
++    VisitorLog.objects.create(appointment=appt, actor=user,
++        from_status=prev, to_status=new_s, notes=notes)
+ 
+-    return JsonResponse({'appointment': _appt_to_dict(appt)})
++    resp = {'appointment': _appt_to_dict(appt)}
++    if sms:
++        resp['sms'] = sms
++    return JsonResponse(resp)
+ 
+ 
+ @csrf_exempt
+diff --git a/apps/visitors/forms.py b/apps/visitors/forms.py
+index 6bcd5c9..7e87dad 100644
+--- a/apps/visitors/forms.py
++++ b/apps/visitors/forms.py
+@@ -1,12 +1,29 @@
+ from django import forms
+ from django.utils import timezone
+ from .models import VisitorAppointment, WhatsAppConfig
++from .sms import normalize_phone, display_phone
+ from apps.departments.models import Department
+ from apps.accounts.models import User
+ 
+ 
++PHONE_HELP = 'Enter a Kenyan mobile number, e.g. 0712345678 or +254712345678.'
++
+ 
+ class AppointmentForm(forms.ModelForm):
++    """
++    Booking form.
++    - If neither a host nor a department is chosen, the department of the person
++      filling in the form is used automatically.
++    - The host (see VisitorAppointment.find_host) is the only person notified, by SMS.
++      Their mobile number is pre-filled from their profile; whatever is entered here
++      is saved back to their profile and reused until someone changes it.
++    """
++    host_phone = forms.CharField(
++        required=False, label='Host mobile number (SMS)',
++        widget=forms.TextInput(attrs={
++            'class': 'form-control', 'placeholder': 'e.g. 0712345678',
++            'inputmode': 'tel', 'autocomplete': 'off'}))
++
+     class Meta:
+         model  = VisitorAppointment
+         fields = [
+@@ -33,25 +50,91 @@ class AppointmentForm(forms.ModelForm):
+             'notes':             forms.Textarea(attrs={'class':'form-control','rows':2,'placeholder':'Any other notes'}),
+         }
+ 
+-    def __init__(self, *args, **kwargs):
++    def __init__(self, *args, user=None, **kwargs):
++        self.user = user
++        self.resolved_host = None
++        self.auto_department = False
+         super().__init__(*args, **kwargs)
+         self.fields['host_user'].required = False
+         self.fields['host_user'].empty_label = '— Select staff member (if known) —'
+         self.fields['host_user'].queryset = User.objects.filter(
+             is_active=True).order_by('first_name', 'last_name')
+         self.fields['host_department'].required = False
+-        self.fields['host_department'].empty_label = '— Select department (if host unknown) —'
++        self.fields['host_department'].empty_label = '— Leave blank to use your department —'
+         for f in ['visitor_email','visitor_phone','visitor_company','visitor_id_number',
+                   'scheduled_end','agenda','vehicle_plate','vehicle_make','vehicle_colour','notes']:
+             self.fields[f].required = False
+ 
++        self.fields['visitor_phone'].widget.attrs['placeholder'] = '+254712345678 (optional)'
++
++        # Pre-fill the host's saved number when editing
++        if self.instance.pk and not self.is_bound:
++            host = self.instance.resolve_host()
++            if host and host.phone:
++                self.fields['host_phone'].initial = display_phone(host.phone) or host.phone
++
+     def clean(self):
+         cd = super().clean()
+-        if not cd.get('host_user') and not cd.get('host_department'):
+-            raise forms.ValidationError(
+-                'Please select either a host staff member or a host department.')
++        host_user = cd.get('host_user')
++        department = cd.get('host_department')
++
++        # 1. Nothing selected → use the department of the person filling in the form
++        if not host_user and not department:
++            my_department = getattr(self.user, 'department', None)
++            if not my_department:
++                raise forms.ValidationError(
++                    'You are not assigned to a department, so please select the host '
++                    'staff member or the department being visited.')
++            department = my_department
++            cd['host_department'] = my_department
++            self.auto_department = True
++
++        # 2. Work out who will receive the SMS
++        booked_by = self.instance.booked_by if self.instance.pk else self.user
++        host = VisitorAppointment.find_host(host_user, department, booked_by)
++        self.resolved_host = host
++
++        # 3. Host mobile number: typed value wins, otherwise the saved one
++        typed = (cd.get('host_phone') or '').strip()
++        if typed:
++            if not normalize_phone(typed):
++                self.add_error('host_phone', PHONE_HELP)
++            else:
++                cd['host_phone'] = display_phone(typed)
++        else:
++            saved = display_phone(getattr(host, 'phone', '')) if host else ''
++            if saved:
++                cd['host_phone'] = saved
++            else:
++                name = host.get_full_name() if host else 'the host'
++                self.add_error('host_phone',
++                    f"Enter {name}'s mobile number so they can be notified by SMS. "
++                    f"It will be saved for future visits.")
+         return cd
+ 
++    def save_host_phone(self):
++        """Save the host number to the host's profile if it is new or changed."""
++        host, phone = self.resolved_host, self.cleaned_data.get('host_phone')
++        if host and phone and normalize_phone(host.phone) != normalize_phone(phone):
++            host.phone = phone
++            host.save(update_fields=['phone'])
++            return True
++        return False
++
++
++class MyPhoneForm(forms.Form):
++    """Lets any user save their own mobile number for visitor SMS alerts."""
++    phone = forms.CharField(
++        label='My mobile number',
++        widget=forms.TextInput(attrs={
++            'class': 'form-control', 'placeholder': 'e.g. 0712345678', 'inputmode': 'tel'}))
++
++    def clean_phone(self):
++        phone = display_phone(self.cleaned_data['phone'])
++        if not phone:
++            raise forms.ValidationError(PHONE_HELP)
++        return phone
++
+ 
+ class ArrivalForm(forms.Form):
+     """Used by gatekeeper to log arrival."""
+diff --git a/apps/visitors/models.py b/apps/visitors/models.py
+index d804da0..909f6d3 100644
+--- a/apps/visitors/models.py
++++ b/apps/visitors/models.py
+@@ -140,6 +140,26 @@ class VisitorAppointment(models.Model):
+     def is_today(self):
+         return self.scheduled_date == timezone.now().date()
+ 
++    # ── Host resolution (who receives the SMS) ─────────────────────────────
++    @staticmethod
++    def find_host(host_user=None, host_department=None, booked_by=None):
++        """
++        The person notified about this visit:
++          1. the selected host staff member, else
++          2. the HOD of the selected (or auto-picked) department, else
++          3. the person who booked the appointment.
++        """
++        if host_user:
++            return host_user
++        if host_department:
++            hod = host_department.get_hod()
++            if hod:
++                return hod
++        return booked_by
++
++    def resolve_host(self):
++        return self.find_host(self.host_user, self.host_department, self.booked_by)
++
+ 
+ class VisitorLog(models.Model):
+     """Append-only log of every status change on an appointment."""
+diff --git a/apps/visitors/notifications.py b/apps/visitors/notifications.py
+index a8dc582..7726a9c 100644
+--- a/apps/visitors/notifications.py
++++ b/apps/visitors/notifications.py
+@@ -1,167 +1,72 @@
+ """
+-All visitor-related notifications: in-app, email, WhatsApp.
++Visitor notifications.
++
++The host is the only person notified, and only by SMS (Talksasa BulkSMS).
++No email, in-app or WhatsApp messages are sent to anyone for visitor events.
++
++The host is resolved by VisitorAppointment.resolve_host():
++selected host → HOD of the (auto-picked) department → the person who booked.
++
++Every function returns (ok: bool, detail: str) so the caller can show the
++result on screen and record it in the appointment's activity log.
+ """
+ from django.utils import timezone
+ 
++from .sms import send_sms, normalize_phone
+ 
+-def _email(subject, body_html, recipients):
+-    try:
+-        from apps.settings_manager.models import SystemSetting
+-        from django.core.mail import get_connection, EmailMessage
+-        cfg = SystemSetting.get_email_config()
+-        if not cfg.get('EMAIL_ENABLED') or not recipients:
+-            return
+-        conn = get_connection(
+-            backend='django.core.mail.backends.smtp.EmailBackend',
+-            host=cfg['EMAIL_HOST'], port=int(cfg.get('EMAIL_PORT') or 587),
+-            username=cfg['EMAIL_HOST_USER'], password=cfg['EMAIL_HOST_PASSWORD'],
+-            use_tls=cfg['EMAIL_USE_TLS'], use_ssl=cfg['EMAIL_USE_SSL'], fail_silently=True)
+-        msg = EmailMessage(subject=subject, body=body_html,
+-            from_email=cfg.get('DEFAULT_FROM_EMAIL','noreply@po-system.com'),
+-            to=[r for r in recipients if r], connection=conn)
+-        msg.content_subtype = 'html'
+-        msg.send(fail_silently=True)
+-    except Exception:
+-        pass
+-
+-
+-def _in_app(recipient, kind, title, body='', link=''):
+-    try:
+-        from apps.notify.models import Notification
+-        Notification.send(recipient, kind=kind, title=title, body=body, link=link)
+-    except Exception:
+-        pass
+-
+-
+-def _whatsapp(to_number, message):
+-    try:
+-        from .whatsapp import send_whatsapp
+-        send_whatsapp(to_number, message)
+-    except Exception:
+-        pass
+ 
++def _when(appt):
++    t = appt.scheduled_start.strftime('%H:%M') if hasattr(appt.scheduled_start, 'strftime') \
++        else str(appt.scheduled_start)[:5]
++    d = appt.scheduled_date.strftime('%d %b %Y') if hasattr(appt.scheduled_date, 'strftime') \
++        else str(appt.scheduled_date)
++    return d, t
+ 
+-def notify_host_on_arrival(appointment):
+-    """
+-    When gatekeeper marks ARRIVED:
+-    - In-app notification to host user (if in system)
+-    - Email to host user or dept HOD
+-    - WhatsApp to visitor (if phone on file)
+-    """
+-    from django.urls import reverse
+-    appt = appointment
+-    link = reverse('visitors:detail', kwargs={'pk': appt.pk})
+-
+-    host = appt.host_user
+-    if not host and appt.host_department:
+-        host = appt.host_department.get_hod()
+-
+-    # In-app
+-    if host:
+-        _in_app(host, 'asset_update',
+-            f'Visitor Arrived: {appt.visitor_name}',
+-            f'{appt.visitor_name} from {appt.visitor_company or "—"} has arrived at the gate.',
+-            link)
+-
+-    # Email
+-    recipients = []
+-    if appt.host_user and appt.host_user.email:
+-        recipients.append(appt.host_user.email)
+-    elif host and host.email:
+-        recipients.append(host.email)
+-
+-    if recipients:
+-        _email(
+-            subject=f'[ProcureDesk] Visitor Arrived: {appt.visitor_name}',
+-            body_html=(
+-                f'<p>Dear {host.get_full_name() if host else "Team"},</p>'
+-                f'<p>Your visitor <strong>{appt.visitor_name}</strong>'
+-                f'{" from "+appt.visitor_company if appt.visitor_company else ""} '
+-                f'has arrived at the gate.</p>'
+-                f'<p><strong>Appointment:</strong> {appt.ref_number}<br>'
+-                f'<strong>Scheduled:</strong> {appt.scheduled_date} {appt.scheduled_start}'
+-                f'{" — "+str(appt.scheduled_end) if appt.scheduled_end else ""}<br>'
+-                f'{"<strong>Agenda:</strong> "+appt.agenda+"<br>" if appt.agenda else ""}'
+-                f'{"<strong>Vehicle:</strong> "+appt.vehicle_plate+" "+appt.vehicle_make if appt.vehicle_plate else ""}</p>'
+-                f'<p>Please proceed to receive your visitor.</p>'
+-            ),
+-            recipients=recipients,
+-        )
+-
+-    # WhatsApp to visitor
+-    if appt.visitor_phone:
+-        msg = (
+-            f'Hello {appt.visitor_name},\n\n'
+-            f'You have been checked in at the gate.\n'
+-            f'Appointment Ref: {appt.ref_number}\n'
+-            f'Your host has been notified and will receive you shortly.\n\n'
+-            f'Thank you for visiting.'
+-        )
+-        _whatsapp(appt.visitor_phone, msg)
+-
+-    appointment.host_notified_at = timezone.now()
+-    appointment.arrival_whatsapp_sent = bool(appt.visitor_phone)
+-    appointment.save(update_fields=['host_notified_at', 'arrival_whatsapp_sent'])
++
++def _visitor(appt):
++    return appt.visitor_name + (f' ({appt.visitor_company})' if appt.visitor_company else '')
++
++
++def _sms_host(appt, message):
++    host = appt.resolve_host()
++    if not host:
++        return False, 'No host could be determined for this visit.'
++    if not normalize_phone(host.phone):
++        return False, f'{host.get_full_name() or host.username} has no valid mobile number saved.'
++    ok, detail = send_sms(host.phone, message)
++    who = host.get_full_name() or host.username
++    return ok, (f'SMS sent to host {who}.' if ok else f'SMS to host {who} failed: {detail}')
+ 
+ 
+ def notify_appointment_booked(appointment):
+-    """Confirm appointment to host and visitor when created."""
+     appt = appointment
+-    from django.urls import reverse
+-    link = reverse('visitors:detail', kwargs={'pk': appt.pk})
+-
+-    host = appt.host_user
+-    if not host and appt.host_department:
+-        host = appt.host_department.get_hod()
+-
+-    if host:
+-        _in_app(host, 'asset_update',
+-            f'New Appointment: {appt.visitor_name}',
+-            f'Scheduled {appt.scheduled_date} at {appt.scheduled_start}',
+-            link)
+-        if host.email:
+-            _email(
+-                subject=f'[ProcureDesk] Appointment Booked: {appt.visitor_name} — {appt.ref_number}',
+-                body_html=(
+-                    f'<p>Dear {host.get_full_name()},</p>'
+-                    f'<p>A visitor appointment has been booked for you.</p>'
+-                    f'<p><strong>Visitor:</strong> {appt.visitor_name}'
+-                    f'{" — "+appt.visitor_company if appt.visitor_company else ""}<br>'
+-                    f'<strong>Date:</strong> {appt.scheduled_date}<br>'
+-                    f'<strong>Time:</strong> {appt.scheduled_start}'
+-                    f'{" — "+str(appt.scheduled_end) if appt.scheduled_end else ""}<br>'
+-                    f'{"<strong>Agenda:</strong> "+appt.agenda if appt.agenda else ""}</p>'
+-                    f'<p>Ref: {appt.ref_number}</p>'
+-                ),
+-                recipients=[host.email],
+-            )
+-
+-    # WhatsApp confirmation to visitor
+-    if appt.visitor_phone:
+-        msg = (
+-            f'Dear {appt.visitor_name},\n\n'
+-            f'Your appointment has been confirmed.\n\n'
+-            f'Ref: {appt.ref_number}\n'
+-            f'Date: {appt.scheduled_date}\n'
+-            f'Time: {appt.scheduled_start}'
+-            + (f' — {appt.scheduled_end}' if appt.scheduled_end else '') + '\n'
+-            + (f'Host: {host.get_full_name()}' if host else '') + '\n\n'
+-            f'Please bring a valid ID on arrival.\nThank you.'
+-        )
+-        _whatsapp(appt.visitor_phone, msg)
+-
+-
+-def notify_appointment_cancelled(appointment):
++    host = appt.resolve_host()
++    date, time = _when(appt)
++    msg = (f'Hello {host.first_name if host else ""}, a visitor is booked to see you: '
++           f'{_visitor(appt)} on {date} at {time}. Ref {appt.ref_number}.')
++    return _sms_host(appt, msg)
++
++
++def notify_host_on_arrival(appointment):
++    appt = appointment
++    host = appt.resolve_host()
++    badge = f' Badge {appt.badge_number}.' if appt.badge_number else ''
++    msg = (f'Hello {host.first_name if host else ""}, your visitor {_visitor(appt)} '
++           f'has arrived at the gate.{badge} Ref {appt.ref_number}.')
++    ok, detail = _sms_host(appt, msg)
++    if ok:
++        appt.host_notified_at = timezone.now()
++        appt.save(update_fields=['host_notified_at'])
++    return ok, detail
++
++
++def notify_appointment_cancelled(appointment, actor=None):
++    """Tell the host a visit was cancelled — unless the host cancelled it themselves."""
+     appt = appointment
+-    host = appt.host_user
+-    if not host and appt.host_department:
+-        host = appt.host_department.get_hod()
+-
+-    if appt.visitor_phone:
+-        msg = (
+-            f'Dear {appt.visitor_name},\n\n'
+-            f'Your appointment (Ref: {appt.ref_number}) on {appt.scheduled_date} '
+-            f'at {appt.scheduled_start} has been cancelled.\n\n'
+-            f'Please contact the office for more information.'
+-        )
+-        _whatsapp(appt.visitor_phone, msg)
++    host = appt.resolve_host()
++    if host and actor and host.pk == actor.pk:
++        return True, 'Host cancelled the visit; no SMS needed.'
++    date, time = _when(appt)
++    msg = (f'Hello {host.first_name if host else ""}, the visit by {_visitor(appt)} '
++           f'on {date} at {time} has been cancelled. Ref {appt.ref_number}.')
++    return _sms_host(appt, msg)
+diff --git a/apps/visitors/sms.py b/apps/visitors/sms.py
+new file mode 100644
+index 0000000..f210c7f
+--- /dev/null
++++ b/apps/visitors/sms.py
+@@ -0,0 +1,153 @@
++"""
++Talksasa BulkSMS (API v3) client.
++
++    POST {endpoint}/sms/send
++    Authorization: Bearer <API token>
++    {"recipient": "2547XXXXXXXX", "sender_id": "...", "type": "plain", "message": "..."}
++
++Configuration is read from System → SMS Settings (SystemSetting rows) and falls
++back to these environment variables (.env):
++
++    TALKSASA_API_URL     default https://bulksms.talksasa.com/api/v3/
++    TALKSASA_API_TOKEN   your API token, e.g. 4842|xxxxxxxx
++    TALKSASA_SENDER_ID   your approved sender ID
++
++Uses only the Python standard library, so no extra package is required.
++"""
++import json
++import logging
++import re
++import socket
++import urllib.error
++import urllib.request
++
++log = logging.getLogger(__name__)
++
++DEFAULT_ENDPOINT = 'https://bulksms.talksasa.com/api/v3/'
++DEFAULT_SENDER_ID = 'TALK-SASA'
++TIMEOUT_SECONDS = 15
++
++
++# ── Phone numbers ────────────────────────────────────────────────────────────
++
++def normalize_phone(raw):
++    """
++    Return a Kenyan mobile number as 2547XXXXXXXX / 2541XXXXXXXX (the format
++    Talksasa expects, no '+'), or '' if it is not a valid Kenyan mobile number.
++
++    Accepts: 0712345678, 712345678, +254712345678, 254 712 345 678, 0112345678 …
++    """
++    digits = re.sub(r'\D', '', str(raw or ''))
++    if digits.startswith('254') and len(digits) == 12:
++        pass
++    elif digits.startswith('0') and len(digits) == 10:
++        digits = '254' + digits[1:]
++    elif len(digits) == 9:
++        digits = '254' + digits
++    else:
++        return ''
++    if digits[3] not in '17':          # Kenyan mobile ranges are 07xx and 01xx
++        return ''
++    return digits
++
++
++def display_phone(raw):
++    """+2547XXXXXXXX for storing on the user profile and showing on screen."""
++    n = normalize_phone(raw)
++    return f'+{n}' if n else ''
++
++
++def mask_phone(raw):
++    n = normalize_phone(raw)
++    return f'+{n[:6]}***{n[-3:]}' if n else ''
++
++
++# ── Configuration ────────────────────────────────────────────────────────────
++
++def get_config():
++    from apps.settings_manager.models import SystemSetting
++    return SystemSetting.get_sms_config()
++
++
++def is_configured(cfg=None):
++    cfg = cfg or get_config()
++    return bool(cfg['enabled'] and cfg['token'])
++
++
++# ── Sending ──────────────────────────────────────────────────────────────────
++
++def _error_text(body, fallback):
++    try:
++        data = json.loads(body)
++        msg = data.get('message') or data.get('error') or data.get('errors')
++        if isinstance(msg, (dict, list)):
++            msg = json.dumps(msg)
++        return str(msg) if msg else fallback
++    except Exception:
++        return (body or fallback)[:200]
++
++
++def send_sms(phone, message, cfg=None):
++    """
++    Send one SMS. Never raises.
++    Returns (ok: bool, detail: str) — detail is shown to the user / logged.
++    """
++    cfg = cfg or get_config()
++    if not cfg['enabled']:
++        return False, 'SMS is disabled in System → SMS Settings.'
++    if not cfg['token']:
++        return False, 'Talksasa API token is not set in System → SMS Settings.'
++
++    recipient = normalize_phone(phone)
++    if not recipient:
++        return False, f'"{phone}" is not a valid Kenyan mobile number.'
++
++    url = cfg['endpoint'].rstrip('/') + '/sms/send'
++    payload = {
++        'recipient': recipient,
++        'sender_id': cfg['sender_id'] or DEFAULT_SENDER_ID,
++        'type': 'plain',
++        'message': message,
++    }
++    req = urllib.request.Request(
++        url,
++        data=json.dumps(payload).encode('utf-8'),
++        method='POST',
++        headers={
++            'Authorization': f"Bearer {cfg['token']}",
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++        },
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
++            body = resp.read().decode('utf-8', 'replace')
++    except urllib.error.HTTPError as e:
++        body = e.read().decode('utf-8', 'replace')
++        detail = f'Talksasa HTTP {e.code}: {_error_text(body, e.reason)}'
++        log.warning('SMS to %s failed: %s', mask_phone(recipient), detail)
++        return False, detail
++    except (urllib.error.URLError, socket.timeout, OSError) as e:
++        detail = f'Could not reach Talksasa: {getattr(e, "reason", e)}'
++        log.warning('SMS to %s failed: %s', mask_phone(recipient), detail)
++        return False, detail
++
++    try:
++        data = json.loads(body)
++    except ValueError:
++        log.warning('SMS to %s: non-JSON response: %s', mask_phone(recipient), body[:200])
++        return False, 'Talksasa returned an unexpected response.'
++
++    status = data.get('status')
++    failed = (
++        status is False
++        or (isinstance(status, str) and status.lower() in ('error', 'failed', 'fail'))
++        or data.get('success') is False
++    )
++    if failed:
++        detail = f'Talksasa rejected the SMS: {_error_text(body, "unknown error")}'
++        log.warning('SMS to %s failed: %s', mask_phone(recipient), detail)
++        return False, detail
++
++    log.info('SMS sent to %s', mask_phone(recipient))
++    return True, f'SMS sent to {mask_phone(recipient)}.'
+diff --git a/apps/visitors/urls.py b/apps/visitors/urls.py
+index 76e8742..052ab85 100644
+--- a/apps/visitors/urls.py
++++ b/apps/visitors/urls.py
+@@ -14,6 +14,8 @@ urlpatterns = [
+     path("<int:pk>/edit/",            views.AppointmentUpdateView.as_view(),name="edit"),
+     path("<int:pk>/arrive/",          views.mark_arrived,                   name="arrive"),
+     path("<int:pk>/status/",          views.update_status,                  name="update_status"),
++    path("host-lookup/",              views.host_lookup,                    name="host_lookup"),
++    path("my-phone/",                 views.save_my_phone,                  name="save_my_phone"),
+     path("whatsapp/",                 views.WhatsAppConfigView.as_view(),   name="whatsapp_config"),
+     path("whatsapp/test/",            views.test_whatsapp,                  name="test_whatsapp"),
+ 
+diff --git a/apps/visitors/views.py b/apps/visitors/views.py
+index fdd541d..3c478e8 100644
+--- a/apps/visitors/views.py
++++ b/apps/visitors/views.py
+@@ -3,6 +3,7 @@ from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
+ from django.contrib.auth.decorators import login_required
+ from django.core.exceptions import PermissionDenied
+ from django.db.models import Q, Count
++from django.http import JsonResponse
+ from django.shortcuts import get_object_or_404, redirect
+ from django.urls import reverse
+ from django.utils import timezone
+@@ -10,7 +11,14 @@ from django.views.generic import (
+     ListView, DetailView, CreateView, UpdateView, TemplateView)
+ 
+ from .models import VisitorAppointment, VisitorLog, WhatsAppConfig
+-from .forms import AppointmentForm, ArrivalForm, StatusUpdateForm, WhatsAppConfigForm
++from .forms import (AppointmentForm, ArrivalForm, StatusUpdateForm, WhatsAppConfigForm,
++                    MyPhoneForm)
++from .sms import display_phone, mask_phone, is_configured as sms_is_configured
++
++
++def _flash_sms(request, ok, detail):
++    """Show the SMS result to the user."""
++    (messages.info if ok else messages.warning)(request, detail)
+ 
+ 
+ # ── Access helpers ────────────────────────────────────────────────────────────
+@@ -71,6 +79,8 @@ class VisitorDashboardView(LoginRequiredMixin, TemplateView):
+ 
+         ctx['can_create'] = True
+         ctx['is_gatekeeper'] = _is_gatekeeper(user)
++        ctx['my_phone'] = display_phone(user.phone)
++        ctx['my_phone_form'] = MyPhoneForm(initial={'phone': ctx['my_phone'] or user.phone})
+         return ctx
+ 
+ 
+@@ -138,13 +148,19 @@ class AppointmentDetailView(LoginRequiredMixin, DetailView):
+         ctx['is_gatekeeper']  = _is_gatekeeper(self.request.user)
+ 
+         a = self.object
++        host = a.resolve_host()
++        ctx['sms_host'] = host
++        ctx['sms_host_phone'] = mask_phone(host.phone) if host else ''
+ 
+         ctx['info_rows'] = [
+             ('Ref Number', a.ref_number),
+             ('Status', a.get_status_display()),
+             ('Scheduled', f"{a.scheduled_date} {a.scheduled_start}"),
+             ('Host', a.host_display),
+-            ('WhatsApp Sent', 'Yes' if a.arrival_whatsapp_sent else 'No'),
++            ('SMS goes to', (host.get_full_name() or host.username) if host else '—'),
++            ('Host mobile', ctx['sms_host_phone'] or 'Not saved'),
++            ('Host SMS (arrival)', a.host_notified_at.strftime('%d %b %H:%M')
++                                   if a.host_notified_at else 'Not sent'),
+             ('ID Number', a.visitor_id_number or '—'),
+             ('Created', a.created_at.strftime('%d %b %Y %H:%M')),
+         ]
+@@ -162,22 +178,40 @@ class AppointmentCreateView(LoginRequiredMixin, CreateView):
+     form_class = AppointmentForm
+     template_name = 'visitors/form.html'
+ 
++    def get_form_kwargs(self):
++        kwargs = super().get_form_kwargs()
++        kwargs['user'] = self.request.user
++        return kwargs
++
+     def form_valid(self, form):
+         appt = form.save(commit=False)
+         appt.booked_by = self.request.user
+         if appt.status == '': appt.status = 'SCHEDULED'
+         appt.save()
++        phone_saved = form.save_host_phone()
++
++        from .notifications import notify_appointment_booked
++        ok, detail = notify_appointment_booked(appt)
++
++        notes = ['Appointment created.']
++        if form.auto_department:
++            notes.append(f'Department auto-selected: {appt.host_department.name}.')
++        if phone_saved:
++            notes.append('Host mobile number saved to profile.')
++        notes.append(detail)
+         VisitorLog.objects.create(
+             appointment=appt, actor=self.request.user,
+-            from_status='', to_status='SCHEDULED', notes='Appointment created.')
+-        from .notifications import notify_appointment_booked
+-        notify_appointment_booked(appt)
++            from_status='', to_status='SCHEDULED', notes=' '.join(notes))
++
+         messages.success(self.request, f'Appointment {appt.ref_number} booked.')
++        _flash_sms(self.request, ok, detail)
+         return redirect(reverse('visitors:detail', kwargs={'pk': appt.pk}))
+ 
+     def get_context_data(self, **kwargs):
+         ctx = super().get_context_data(**kwargs)
+         ctx['page_title'] = 'Book Appointment'
++        ctx['user_department'] = self.request.user.department
++        ctx['sms_ready'] = sms_is_configured()
+         return ctx
+ 
+ 
+@@ -195,14 +229,35 @@ class AppointmentUpdateView(LoginRequiredMixin, UpdateView):
+             raise PermissionDenied
+         return a
+ 
++    def get_form_kwargs(self):
++        kwargs = super().get_form_kwargs()
++        kwargs['user'] = self.request.user
++        return kwargs
++
+     def form_valid(self, form):
++        old_host = VisitorAppointment.objects.get(pk=self.object.pk).resolve_host()
+         appt = form.save()
++        form.save_host_phone()
++        new_host = appt.resolve_host()
+         messages.success(self.request, f'Appointment {appt.ref_number} updated.')
++
++        # Host changed → the new host is told about the visit
++        if new_host and (not old_host or old_host.pk != new_host.pk) \
++                and appt.status == 'SCHEDULED':
++            from .notifications import notify_appointment_booked
++            ok, detail = notify_appointment_booked(appt)
++            VisitorLog.objects.create(
++                appointment=appt, actor=self.request.user,
++                from_status=appt.status, to_status=appt.status,
++                notes=f'Host changed to {new_host.get_full_name()}. {detail}')
++            _flash_sms(self.request, ok, detail)
+         return redirect(reverse('visitors:detail', kwargs={'pk': appt.pk}))
+ 
+     def get_context_data(self, **kwargs):
+         ctx = super().get_context_data(**kwargs)
+         ctx['page_title'] = f'Edit {self.object.ref_number}'
++        ctx['user_department'] = self.request.user.department
++        ctx['sms_ready'] = sms_is_configured()
+         return ctx
+ 
+ 
+@@ -222,14 +277,15 @@ def mark_arrived(request, pk):
+             appt.arrived_at  = timezone.now()
+             appt.badge_number = form.cleaned_data.get('badge_number', '')
+             appt.save(update_fields=['status','arrived_at','badge_number'])
++            from .notifications import notify_host_on_arrival
++            ok, detail = notify_host_on_arrival(appt)
++            notes = form.cleaned_data.get('notes', '')
+             VisitorLog.objects.create(
+                 appointment=appt, actor=request.user,
+                 from_status=prev, to_status='ARRIVED',
+-                notes=form.cleaned_data.get('notes',''))
+-            from .notifications import notify_host_on_arrival
+-            notify_host_on_arrival(appt)
+-            messages.success(request,
+-                f'{appt.visitor_name} checked in. Host has been notified.')
++                notes=(notes + ' ' if notes else '') + detail)
++            messages.success(request, f'{appt.visitor_name} checked in.')
++            _flash_sms(request, ok, detail)
+     return redirect(reverse('visitors:detail', kwargs={'pk': pk}))
+ 
+ 
+@@ -249,18 +305,79 @@ def update_status(request, pk):
+             if new_s in ('COMPLETED','NO_SHOW'):
+                 appt.checked_out_at = timezone.now()
+             appt.save()
++            notes = form.cleaned_data.get('notes', '')
++            sms = None
++            if new_s == 'CANCELLED' and prev != 'CANCELLED':
++                from .notifications import notify_appointment_cancelled
++                sms = notify_appointment_cancelled(appt, actor=request.user)
++                notes = (notes + ' ' if notes else '') + sms[1]
+             VisitorLog.objects.create(
+                 appointment=appt, actor=request.user,
+-                from_status=prev, to_status=new_s,
+-                notes=form.cleaned_data.get('notes',''))
+-            if new_s == 'CANCELLED':
+-                from .notifications import notify_appointment_cancelled
+-                notify_appointment_cancelled(appt)
++                from_status=prev, to_status=new_s, notes=notes)
+             messages.success(request, f'Status updated to {appt.get_status_display()}.')
++            if sms:
++                _flash_sms(request, *sms)
+     return redirect(reverse('visitors:detail', kwargs={'pk': pk}))
+ 
+ 
+-# ── WhatsApp config (staff only) ──────────────────────────────────────────────
++# ── Host lookup + "my mobile number" ─────────────────────────────────────────
++
++@login_required
++def host_lookup(request):
++    """
++    JSON used by the booking form: who will receive the SMS for the current
++    host / department selection, and the mobile number saved for them.
++    """
++    from apps.accounts.models import User
++    from apps.departments.models import Department
++    host_user = department = None
++    auto = False
++    try:
++        if request.GET.get('host_user'):
++            host_user = User.objects.get(pk=int(request.GET['host_user']), is_active=True)
++        if request.GET.get('host_department'):
++            department = Department.objects.get(pk=int(request.GET['host_department']))
++    except (ValueError, User.DoesNotExist, Department.DoesNotExist):
++        return JsonResponse({'error': 'Not found.'}, status=404)
++
++    if not host_user and not department:
++        department = request.user.department
++        auto = True
++
++    host = VisitorAppointment.find_host(host_user, department, request.user)
++    hod = department.get_hod() if department else None
++    if host_user:
++        role = 'Selected host'
++    elif hod:
++        role = f'HOD, {department.name}'
++    elif department:
++        role = f'You — {department.name} has no HOD set'
++    else:
++        role = 'You'
++    return JsonResponse({
++        'name': (host.get_full_name() or host.username) if host else '',
++        'role': role,
++        'phone': display_phone(host.phone) if host else '',
++        'auto_department': department.name if (auto and department) else '',
++        'no_department': auto and not department,
++    })
++
++
++@login_required
++def save_my_phone(request):
++    """Save the signed-in user's own mobile number (used for visitor SMS)."""
++    if request.method == 'POST':
++        form = MyPhoneForm(request.POST)
++        if form.is_valid():
++            request.user.phone = form.cleaned_data['phone']
++            request.user.save(update_fields=['phone'])
++            messages.success(request, f'Your mobile number {request.user.phone} has been saved.')
++        else:
++            messages.error(request, form.errors['phone'][0])
++    return redirect(reverse('visitors:dashboard'))
++
++
++# ── WhatsApp config (staff only) — no longer used for visitor notifications ──
+ 
+ class WhatsAppConfigView(LoginRequiredMixin, UserPassesTestMixin, TemplateView):
+     template_name = 'visitors/whatsapp_config.html'
+@@ -311,16 +428,16 @@ def api_docs(request):
+          "description":"Returns paginated appointments scoped to the calling user's role. Supports ?status=, ?date=YYYY-MM-DD, ?q=, ?page=, ?per_page=.",
+          "params":"","example":'{"total":5,"page":1,"per_page":20,"results":[...]}'},
+         {"method":"POST","path":"/visitors/api/appointments/","title":"Create appointment",
+-         "description":"Book a new visitor appointment.",
+-         "params":"visitor_name* (str), scheduled_date* (YYYY-MM-DD), scheduled_start* (HH:MM), host_user (id) OR host_department (id), visitor_phone, visitor_company, agenda, vehicle_plate, vehicle_make, vehicle_colour",
++         "description":"Book a new visitor appointment. If neither host_user nor host_department is sent, the caller's department is used. The host is notified by SMS; host_phone is required if the host has no mobile number saved (it is then saved to their profile).",
++         "params":"visitor_name* (str), scheduled_date* (YYYY-MM-DD), scheduled_start* (HH:MM), host_user (id), host_department (id), host_phone (str), visitor_phone, visitor_company, agenda, vehicle_plate, vehicle_make, vehicle_colour",
+          "example":'{"appointment":{"ref_number":"VIS-20250101-A1B2C","status":"SCHEDULED",...}}'},
+         {"method":"GET","path":"/visitors/api/appointments/<ref>/","title":"Appointment detail",
+          "description":"Full detail of a single appointment by ref_number.",
+          "params":"","example":'{"appointment":{...}}'},
+         {"method":"POST","path":"/visitors/api/appointments/<ref>/arrive/","title":"Check in visitor",
+-         "description":"Gatekeeper marks visitor as arrived. Triggers host notification and WhatsApp.",
++         "description":"Gatekeeper marks visitor as arrived. Sends an SMS to the host.",
+          "params":"badge_number (str, optional), notes (str, optional)",
+-         "example":'{"appointment":{...},"message":"Visitor checked in."}'},
++         "example":'{"appointment":{...},"message":"Visitor checked in.","sms":{"sent":true,"detail":"SMS sent to host Jane Doe."}}'},
+         {"method":"POST","path":"/visitors/api/appointments/<ref>/status/","title":"Update status",
+          "description":"Change appointment status. Valid values: ARRIVED, IN_MEETING, COMPLETED, NO_SHOW, CANCELLED.",
+          "params":"status* (str), notes (str, optional)",
+diff --git a/templates/base.html b/templates/base.html
+index 028423a..838b179 100644
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -290,14 +290,6 @@ pre{white-space:pre-wrap;font-family:monospace;font-size:12px;background:#f8fafc
+                     Book Appointment
+                 </a>
+ 
+-                {% if request.user.is_staff %}
+-                <a class="nav-item {% if request.resolver_match.url_name == 'whatsapp_config' %}active{% endif %}"
+-                   href="/Operations/visitors/whatsapp/">
+-                    <i class="bi bi-whatsapp nav-icon"></i>
+-                    WhatsApp Config
+-                </a>
+-                {% endif %}
+-
+             </div>
+ 
+             <!-- ── Stock & Assets ──────────────────────────── -->
+@@ -344,12 +336,18 @@ pre{white-space:pre-wrap;font-family:monospace;font-size:12px;background:#f8fafc
+                 </a>
+ 
+                 {% if request.user.is_staff %}
+-                <a class="nav-item {% if request.resolver_match.app_name == 'settings_manager' %}active{% endif %}"
++                <a class="nav-item {% if request.resolver_match.app_name == 'settings_manager' and request.resolver_match.url_name == 'email' %}active{% endif %}"
+                    href="/Operations/system/email/">
+                     <i class="bi bi-envelope-gear nav-icon"></i>
+                     Email Settings
+                 </a>
+ 
++                <a class="nav-item {% if request.resolver_match.app_name == 'settings_manager' and request.resolver_match.url_name == 'sms' %}active{% endif %}"
++                   href="/Operations/system/sms/">
++                    <i class="bi bi-chat-dots nav-icon"></i>
++                    SMS Settings
++                </a>
++
+                 <a class="nav-item" href="/Operations/admin/">
+                     <i class="bi bi-gear nav-icon"></i>
+                     Admin Panel
+diff --git a/templates/settings_manager/sms.html b/templates/settings_manager/sms.html
+new file mode 100644
+index 0000000..84c951c
+--- /dev/null
++++ b/templates/settings_manager/sms.html
+@@ -0,0 +1,114 @@
++{% extends 'base.html' %}
++{% load settings_tags %}
++{% block title %}SMS Settings{% endblock %}
++{% block topbar_title %}SMS Settings{% endblock %}
++
++{% block content %}
++<div style="max-width:760px">
++
++  <div class="card mb-16">
++    <div class="card-header">
++      <span class="card-title"><i class="bi bi-chat-dots" style="margin-right:8px;color:var(--brand)"></i>Talksasa BulkSMS</span>
++      {% if sms_config.enabled and sms_config.token %}
++        <span class="badge badge-approved"><i class="bi bi-check-circle"></i> Active</span>
++      {% elif sms_config.enabled %}
++        <span class="badge badge-warning">Enabled — token missing</span>
++      {% else %}
++        <span class="badge badge-cancelled">Disabled</span>
++      {% endif %}
++    </div>
++    <div class="card-body">
++      <p class="text-muted fs-13 mb-16">
++        Visitor notifications are sent by SMS to the <strong>host only</strong>: when a visit is booked,
++        when the visitor is checked in at the gate, and when a visit is cancelled.
++        Changes take effect immediately.
++      </p>
++
++      <form method="post">
++        {% csrf_token %}
++
++        <div class="card mb-16" style="border-color:var(--brand-light);background:var(--brand-light)">
++          <div class="card-body" style="padding:14px 18px">
++            <div class="d-flex align-center justify-between">
++              <div>
++                <div class="fw-600 fs-13">Enable SMS Notifications</div>
++                <div class="text-muted fs-12">Keep disabled while you set up, then enable and send a test.</div>
++              </div>
++              {% with s=field_map|get_item:'sms_enabled' %}
++              <select name="sms_enabled" class="form-select" style="width:auto">
++                <option value="false" {% if not s or s.value != 'true' %}selected{% endif %}>Disabled</option>
++                <option value="true"  {% if s and s.value == 'true' %}selected{% endif %}>Enabled</option>
++              </select>
++              {% endwith %}
++            </div>
++          </div>
++        </div>
++
++        <div class="grid grid-2" style="gap:16px;margin-bottom:16px">
++          <div style="grid-column:span 2" class="form-group">
++            <label class="form-label">API Endpoint (OAuth 2.0)</label>
++            {% with s=field_map|get_item:'sms_api_url' %}
++            <input type="url" name="sms_api_url" class="form-control"
++                   value="{{ s.value|default:'https://bulksms.talksasa.com/api/v3/' }}"
++                   placeholder="https://bulksms.talksasa.com/api/v3/">
++            {% endwith %}
++            <div class="form-hint">Messages are posted to <code>&lt;endpoint&gt;sms/send</code>.</div>
++          </div>
++
++          <div class="form-group">
++            <label class="form-label">API Token</label>
++            <input type="password" name="sms_api_token" class="form-control"
++                   placeholder="{% if token_saved %}Saved ({{ token_hint }}) — leave blank to keep{% else %}Paste token, e.g. 4842|xxxxxxxx{% endif %}"
++                   autocomplete="new-password">
++            {% if token_from_env %}
++              <div class="form-hint">Currently using TALKSASA_API_TOKEN from the server's .env file.</div>
++            {% elif token_saved %}
++              <label class="fs-12 text-muted" style="display:flex;gap:6px;align-items:center;margin-top:6px">
++                <input type="checkbox" name="sms_api_token_clear" value="1"> Remove the saved token
++              </label>
++            {% else %}
++              <div class="form-hint">Sent as <code>Authorization: Bearer &lt;token&gt;</code>. Never share it by email or chat.</div>
++            {% endif %}
++          </div>
++
++          <div class="form-group">
++            <label class="form-label">Sender ID</label>
++            {% with s=field_map|get_item:'sms_sender_id' %}
++            <input type="text" name="sms_sender_id" class="form-control" maxlength="11"
++                   value="{{ s.value|default:'' }}" placeholder="e.g. TALK-SASA">
++            {% endwith %}
++            <div class="form-hint">The approved sender name on your Talksasa account (max 11 characters).</div>
++          </div>
++        </div>
++
++        <button type="submit" class="btn btn-primary"><i class="bi bi-save"></i> Save Settings</button>
++      </form>
++    </div>
++  </div>
++
++  <div class="card mb-16">
++    <div class="card-header"><span class="card-title"><i class="bi bi-send" style="margin-right:6px"></i>Send Test SMS</span></div>
++    <div class="card-body">
++      <p class="text-muted fs-13 mb-16">Send a test message to confirm the token and sender ID work. SMS must be <strong>enabled</strong> above first.</p>
++      <form method="post" action="{% url 'settings_manager:test_sms' %}">
++        {% csrf_token %}
++        <div class="d-flex gap-12 align-center">
++          <div style="flex:1;max-width:320px">
++            <input type="text" name="test_sms_to" class="form-control" placeholder="0712345678" inputmode="tel" required>
++          </div>
++          <button type="submit" class="btn btn-outline"><i class="bi bi-send"></i> Send Test</button>
++        </div>
++      </form>
++    </div>
++  </div>
++
++  <div class="card" style="background:#f8fafc">
++    <div class="card-body fs-12 text-muted">
++      <div class="fw-600 mb-4" style="color:var(--text)"><i class="bi bi-lightbulb" style="margin-right:4px"></i>Mobile numbers</div>
++      Hosts' numbers are stored on their user profile. Users can save their own number on the Visitor Dashboard,
++      and whoever books a visit can enter or update the host's number on the booking form; it is then reused
++      until someone changes it. Numbers are accepted as 0712345678, 712345678 or +254712345678.
++    </div>
++  </div>
++</div>
++{% endblock %}
+diff --git a/templates/visitors/dashboard.html b/templates/visitors/dashboard.html
+index c82257d..cab51cd 100644
+--- a/templates/visitors/dashboard.html
++++ b/templates/visitors/dashboard.html
+@@ -31,6 +31,24 @@
+   </div>
+ </div>
+ 
++<!-- My mobile number for visitor SMS -->
++<div class="card mb-16" {% if not my_phone %}style="border-left:4px solid var(--warning)"{% endif %}>
++  <div class="card-body" style="padding:12px 18px">
++    <form method="post" action="{% url 'visitors:save_my_phone' %}" class="d-flex align-center gap-12" style="flex-wrap:wrap">
++      {% csrf_token %}
++      <div style="flex:1;min-width:240px">
++        <div class="fw-600 fs-13"><i class="bi bi-phone" style="margin-right:6px;color:var(--brand)"></i>My mobile number for visitor SMS</div>
++        <div class="text-muted fs-12">
++          {% if my_phone %}You will get an SMS on <strong>{{ my_phone }}</strong> when your visitors are booked or arrive.
++          {% else %}Add your number so you get an SMS when your visitors are booked or arrive. It is saved until you change it.{% endif %}
++        </div>
++      </div>
++      <div style="width:200px">{{ my_phone_form.phone }}</div>
++      <button type="submit" class="btn {% if my_phone %}btn-outline{% else %}btn-primary{% endif %} btn-sm"><i class="bi bi-save"></i> {% if my_phone %}Update{% else %}Save{% endif %}</button>
++    </form>
++  </div>
++</div>
++
+ <!-- Today's appointments -->
+ <div class="card mb-16" style="border-top:3px solid var(--brand)">
+   <div class="card-header">
+diff --git a/templates/visitors/detail.html b/templates/visitors/detail.html
+index 3249eff..c61dc01 100644
+--- a/templates/visitors/detail.html
++++ b/templates/visitors/detail.html
+@@ -87,7 +87,7 @@
+     <div class="action-panel success mb-16">
+       <div class="action-panel-header"><i class="bi bi-person-check"></i> Check In Visitor</div>
+       <div class="action-panel-body">
+-        <p class="text-muted fs-12 mb-8">Confirm the visitor has arrived. Host will be notified immediately{% if appt.visitor_phone %} and a WhatsApp confirmation sent to the visitor{% endif %}.</p>
++        <p class="text-muted fs-12 mb-8">Confirm the visitor has arrived. {% if sms_host %}<strong>{{ sms_host.get_full_name|default:sms_host.username }}</strong> will get an SMS{% if sms_host_phone %} on {{ sms_host_phone }}{% else %} — but has no mobile number saved{% endif %}.{% endif %}</p>
+         <form method="post" action="{% url 'visitors:arrive' appt.pk %}">
+           {% csrf_token %}
+           <div class="form-group"><label class="form-label fs-12">Badge / Pass Number (optional)</label>{{ arrival_form.badge_number }}</div>
+diff --git a/templates/visitors/form.html b/templates/visitors/form.html
+index 672b62a..2ce8ca0 100644
+--- a/templates/visitors/form.html
++++ b/templates/visitors/form.html
+@@ -32,9 +32,9 @@
+               {{ form.visitor_name }}
+             </div>
+             <div class="form-group">
+-              <label class="form-label">Phone (WhatsApp)</label>
++              <label class="form-label">Phone</label>
+               {{ form.visitor_phone }}
+-              <div class="form-hint">Used to send WhatsApp confirmations. Include country code e.g. +254…</div>
++              <div class="form-hint">For the gate's records only — the visitor is not sent any message.</div>
+             </div>
+             <div class="form-group">
+               <label class="form-label">Email</label>
+@@ -58,7 +58,11 @@
+         <div class="card-body">
+           <div class="alert alert-info mb-16" style="padding:8px 14px">
+             <i class="bi bi-info-circle"></i>
+-            <span class="fs-12">Select either a specific staff member OR a department. If the person is not in the system, select their department and the HOD will be notified.</span>
++            <span class="fs-12">
++              Select a staff member, or a department (its HOD becomes the host).
++              {% if user_department %}Leave both blank to use <strong>your department — {{ user_department.name }}</strong>.
++              {% else %}You are not assigned to a department, so choose one of them.{% endif %}
++            </span>
+           </div>
+           <div class="grid grid-2" style="gap:16px">
+             <div class="form-group">
+@@ -70,6 +74,19 @@
+               {{ form.host_department }}
+             </div>
+           </div>
++
++          <!-- Who gets the SMS + their mobile number -->
++          <div id="sms-target" class="mt-4" style="background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:12px 14px">
++            <div class="fs-12 text-muted fw-600 mb-4"><i class="bi bi-chat-dots" style="margin-right:4px"></i>SMS notification goes to</div>
++            <div class="fw-600 fs-13" id="sms-host-name">—</div>
++            <div class="text-muted fs-12 mb-8" id="sms-host-role"></div>
++            <div class="form-group" style="margin-bottom:0;max-width:340px">
++              <label class="form-label">Host mobile number <span class="req">*</span></label>
++              {{ form.host_phone }}
++              {% if form.host_phone.errors %}<div class="form-error">{{ form.host_phone.errors.0 }}</div>{% endif %}
++              <div class="form-hint" id="sms-phone-hint">Saved to the host's profile and reused until it is changed.</div>
++            </div>
++          </div>
+         </div>
+       </div>
+ 
+@@ -122,9 +139,15 @@
+         <div class="card-header"><span class="card-title">Book Appointment</span></div>
+         <div class="card-body">
+           <p class="text-muted fs-12 mb-16">
+-            The host will be notified immediately.
+-            If a WhatsApp number is provided, the visitor will receive a confirmation message.
++            The host is the only person notified, by SMS: now, when the visitor
++            is checked in at the gate, and if the visit is cancelled.
+           </p>
++          {% if not sms_ready %}
++          <div class="alert alert-warning mb-16" style="padding:8px 12px">
++            <i class="bi bi-exclamation-triangle"></i>
++            <span class="fs-12">SMS is not set up yet, so no message will be sent. An administrator can enable it under System → SMS Settings.</span>
++          </div>
++          {% endif %}
+           <button type="submit" class="btn btn-primary btn-block mb-8">
+             <i class="bi bi-calendar-check"></i>
+             {% if "Edit" in page_title %}Save Changes{% else %}Book Appointment{% endif %}
+@@ -136,3 +159,44 @@
+   </div>
+ </form>
+ {% endblock %}
++
++{% block extra_js %}
++<script>
++(function () {
++  const hostSel = document.querySelector('select[name="host_user"]');
++  const deptSel = document.querySelector('select[name="host_department"]');
++  const phone   = document.querySelector('input[name="host_phone"]');
++  const nameEl  = document.getElementById('sms-host-name');
++  const roleEl  = document.getElementById('sms-host-role');
++  const hintEl  = document.getElementById('sms-phone-hint');
++  if (!hostSel || !deptSel || !phone) return;
++  const keepTyped = phone.value !== '';   // re-shown after a validation error
++  let first = true;
++
++  function lookup() {
++    const qs = new URLSearchParams({ host_user: hostSel.value, host_department: deptSel.value });
++    fetch('{% url "visitors:host_lookup" %}?' + qs.toString(), { credentials: 'same-origin' })
++      .then(r => r.json())
++      .then(d => {
++        if (d.no_department) {
++          nameEl.textContent = 'Select a host or a department';
++          roleEl.textContent = 'You are not assigned to a department.';
++        } else {
++          nameEl.textContent = d.name || '—';
++          roleEl.textContent = d.role + (d.auto_department ? ' (your department, auto-selected)' : '');
++        }
++        if (!(first && keepTyped)) phone.value = d.phone || '';
++        hintEl.textContent = d.phone
++          ? 'Saved number pre-filled. Change it here to update the host’s profile.'
++          : 'No number saved for this host yet. Enter it once; it will be remembered.';
++        hintEl.style.color = d.phone ? '' : 'var(--warning)';
++        first = false;
++      })
++      .catch(() => {});
++  }
++  hostSel.addEventListener('change', lookup);
++  deptSel.addEventListener('change', lookup);
++  lookup();
++})();
++</script>
++{% endblock %}
